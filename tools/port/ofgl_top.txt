@@ -1,0 +1,11 @@
+/* ofgl: one monitor's pictures doubled, with the pictures on the GPU and the optical flow on this CPU: AVX2 and FMA3, at most 8 threads on 8 cores, this program's own thread counted among them.
+ *
+ *   The compositor's cast of the monitor as dmabufs, capped at the rate asked for  ─▶  GPU: is it a new picture (occlusion query), a copy of it, its luma at the field's size  ─▶  the luma's bytes into this process's memory
+ *   ─▶  the flow's threads (src/engine): the field at the middle instant  ─▶  GPU: both frames moved half way along the vectors under the triangle windows of bgra_blend_vx  ─▶  overlay: generated, real, generated, real.
+ *
+ * Rates. --rate N: N pictures a second in, 2 N out, each picture held a whole number of the monitor's refreshes (24 on a 120 Hz monitor: a generated picture 2 refreshes, a real frame 3; 30: 2 and 2). No --rate: half the
+ * refresh in, the refresh out, one picture a refresh. A picture always starts on a refresh: that is the vertical sync.
+ * Threads. The process is confined to one CPU of each of at most 8 cores before anything else exists; the flow gets at most 7 threads, each pinned to a core of its own, and this thread (PipeWire's loop, Wayland, GL: one
+ * thread, so the GL context never changes hands) takes the core that is left.
+ *
+ * Run through a cast of the monitor: desk cast --output NAME --no-cursor -- out/ofgl --node @NODE@ --output NAME   (scripts/ofgl.sh does it) */

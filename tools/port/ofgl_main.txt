@@ -1,0 +1,197 @@
+static void print_second(struct app *a, double secs)
+{
+    struct stats *s = &a->s;
+    printf("%6.1f s cast %6.2f dup %6.2f noslot %llu | flow sent %6.2f made %6.2f scene %llu nomid %llu late %llu | commit g %llu r %llu skip %llu | glass %6.2f/s (g %6.2f r %6.2f) disc %llu cadence 1:%llu 2:%llu 3:%llu 4+:%llu gapmax %.1f ms | latency ms %.1f mean %.1f..%.1f | flow ms %.2f max %.2f wait %.2f moved %.1f | gpu ms %.2f max %.2f\n",
+           secs, (double)s->cast, (double)s->dup, (unsigned long long)s->noslot, (double)s->sent, (double)s->made, (unsigned long long)s->scene, (unsigned long long)s->nomid, (unsigned long long)s->late, (unsigned long long)s->com_g, (unsigned long long)s->com_r, (unsigned long long)s->skip_g,
+           (double)(s->pres_g + s->pres_r), (double)s->pres_g, (double)s->pres_r, (unsigned long long)s->disc, (unsigned long long)s->cad[1], (unsigned long long)s->cad[2], (unsigned long long)s->cad[3], (unsigned long long)s->cad[4], (double)s->gap_max * 1e-6,
+           s->lat_n ? (double)s->lat_sum / (double)s->lat_n * 1e-6 : 0.0, (double)s->lat_min * 1e-6, (double)s->lat_max * 1e-6, s->card_n ? (double)s->card_sum / (double)s->card_n * 1e-3 : 0.0, (double)s->card_max * 1e-3, s->card_n ? (double)s->wait_sum / (double)s->card_n * 1e-3 : 0.0,
+           s->card_n ? (double)s->moved_sum / (double)s->card_n : 0.0, s->gpu_n ? (double)s->gpu_ns / (double)s->gpu_n * 1e-6 : 0.0, (double)s->gpu_max * 1e-6);
+    fflush(stdout);
+    memset(s, 0, sizeof *s);
+}
+
+int main(int argc, char **argv)
+{
+    static struct app a;
+    uint32_t node = 0;
+    int threads = 0, enough = -1, seconds = 0, no_excl = 0, plan = 0;
+    const char *output = NULL;
+    a.div = 2;
+    a.prev = -1;
+    a.can_draw = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--node") && i + 1 < argc)
+            node = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--output") && i + 1 < argc)
+            output = argv[++i];
+        else if (!strcmp(argv[i], "--rate") && i + 1 < argc)
+            a.rate = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--div") && i + 1 < argc)
+            a.div = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--threads") && i + 1 < argc)
+            threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--enough") && i + 1 < argc)
+            enough = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
+            seconds = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pass"))
+            a.pass_only = 1;
+        else if (!strcmp(argv[i], "--probe"))
+            a.probe = 1;
+        else if (!strcmp(argv[i], "--no-excl"))
+            no_excl = 1;
+        else if (!strcmp(argv[i], "--plan"))
+            plan = 1;
+        else {
+            fprintf(stderr, "usage: ofgl --output NAME [--node N: a cast made elsewhere; without it the cast is asked of KWin] [--rate N: pictures a second in, twice that out (24, 30, ...); without it half the refresh in, the refresh out] [--div D: the field is the picture / D, 2 to 4]\n"
+                            "            [--threads T: the flow's threads, 1 to %d, one a core; this program's own thread is one more] [--enough Q6] [--pass: no flow, real frames only] [--probe: the cast and the GPU passes alone, nothing shown] [--seconds S]\n"
+                            "       ofgl --output NAME [--div D] --plan: the output's pixels and mHz, the luma's size, and no run\n", OF_MAX_THREADS - 1);
+            return 2;
+        }
+    }
+    /* The law of the 8 cores, before any library has made a thread: every thread this process will ever own inherits these CPUs. */
+    int cpus[OF_MAX_THREADS];
+    const int cores = of_cpus_pick(cpus, OF_MAX_THREADS);
+    if (of_cpus_confine(cpus, cores))
+        perror("ofgl: affinity");
+    if (!output || a.div < 2 || a.div > 4 || a.rate < 0 || wlp_output_mode(output, &a.W, &a.H, &a.mhz)) {
+        fprintf(stderr, "ofgl: --output must name a monitor, --div is 2 to 4, --rate a number of pictures a second\n");
+        return 2;
+    }
+    a.lw = ((a.W + a.div - 1) / a.div + 15) & ~15;
+    a.lh = (a.H + a.div - 1) / a.div;
+    a.lstride = of_luma_stride(a.lw);
+    a.bw = of_field_w(a.lw);
+    a.bh = of_field_w(a.lh);
+    if (plan) {
+        printf("%d %d %d %d %d\n", a.W, a.H, a.mhz, a.lw, a.lh);
+        return 0;
+    }
+    if (a.rate && (uint64_t)a.rate * 2000u > (uint64_t)a.mhz) {
+        fprintf(stderr, "ofgl: %d in is %d out, more than the monitor's %d.%03d Hz shows\n", a.rate, 2 * a.rate, a.mhz / 1000, a.mhz % 1000);
+        return 2;
+    }
+    if (!of_cpu_ok()) {
+        fprintf(stderr, "ofgl: this CPU has no AVX2 or no FMA3\n");
+        return 1;
+    }
+    /* This thread is one of the 8: the flow gets what is left, at most 7, each a core of its own; with one core they share it. */
+    const int most = cores > 1 ? cores - 1 : 1;
+    if (threads < 1 || threads > most)
+        threads = most;
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGHUP, on_signal);
+    const int with_flow = !a.probe && !a.pass_only;
+    if (a.probe)
+        a.probe_luma = malloc((size_t)a.lstride * (size_t)a.lh);
+    const struct wlp_cb cb = {&a, on_presented, on_discarded, NULL};
+    a.w = wlp_open(output, a.W, a.H, 0, &cb);
+    if (!a.w)
+        return 1;
+    wlp_on_frame(a.w, on_frame_callback, &a);
+    if (gl_open(&a))
+        return 1;
+    if (with_flow && of_engine_open(&a.eng, a.lw, a.lh, cpus, threads, enough))
+        return 1;
+    /* The cast's cap and what a source frame is worth in refreshes, as a fraction: num / den pictures a second in. */
+    const uint32_t cast_num = a.rate ? (uint32_t)a.rate * 1000u : (uint32_t)a.mhz, cast_den = a.rate ? 1000u : 2000u;
+    a.interval_ns = 1000000000ull * cast_den / cast_num;
+    a.refresh_ns = 1000000000000ull / (uint64_t)a.mhz;
+    a.pair_num = (uint64_t)a.mhz * cast_den;
+    a.pair_den = (uint64_t)cast_num * 1000u;
+    int lw, lh;
+    wlp_size(a.w, &lw, &lh);
+    printf("overlay on %s: %d x %d logical, %d x %d buffer, refresh %d mHz; cast capped at %u/%u a second, twice that on the glass, a source frame worth %.3f refreshes (the generated picture the smaller half); the field is the picture / %d: luma %d x %d, %d x %d vectors\n",
+           output, lw, lh, a.W, a.H, a.mhz, cast_num, cast_den, (double)a.pair_num / (double)a.pair_den, a.div, a.lw, a.lh, a.bw, a.bh);
+    int rc = 0, excluded = 0;
+    if (!no_excl && !a.probe) {
+        char cmd[128];
+        snprintf(cmd, sizeof cmd, "scripts/excl.sh on %d >/dev/null", (int)getpid());
+        if (system(cmd)) {
+            fprintf(stderr, "ofgl: the capture exclusion failed: refusing to run a feedback loop\n");
+            rc = 1;
+        }
+        excluded = !rc;
+    }
+    /* No node given: the cast is asked of the compositor on the overlay's own connection. */
+    if (!rc && !node && wlp_cast_open(a.w, &node))
+        rc = 1;
+    if (!rc)
+        printf("cast: PipeWire node %u\n", node);
+    if (!rc && cast_open(&a, node, cast_num, cast_den))
+        rc = 1;
+    wlp_flush(a.w);
+    /* Everything that makes threads has been opened: this thread to its own core, the one the flow does not use. */
+    of_cpus_pin(cpus[cores - 1]);
+    printf("threads: the flow %d on cpus", with_flow ? threads : 0);
+    for (int i = 0; with_flow && i < threads; i++)
+        printf(" %d", cpus[i]);
+    printf(", this thread on cpu %d; %d in the process, the law is %d on %d cores; flow levels %d\n", cpus[cores - 1], of_threads_now(), OF_MAX_THREADS, cores, with_flow ? a.eng.levels : 0);
+    const uint64_t t_start = of_now_ns();
+    uint64_t t_print = t_start + 1000000000ull;
+    int printed_format = 0;
+    while (!rc && !stop && !a.fatal) {
+        struct pollfd q[3] = {{wlp_fd(a.w), POLLIN, 0}, {pw_loop_get_fd(a.loop), POLLIN, 0}, {with_flow ? a.eng.event_fd : -1, POLLIN, 0}};
+        /* Asleep until the compositor, the cast or the flow has something, or the picture on the glass has been held long enough. */
+        uint64_t nap = 5000000ull;
+        const uint64_t due = hold_due(&a), now0 = of_now_ns();
+        if (a.q_head != a.q_tail && due)
+            nap = due > now0 ? (due - now0 < nap ? due - now0 : nap) : 0;
+        const struct timespec ts = {0, (long)nap};
+        ppoll(q, 3, &ts, NULL);
+        if (q[2].revents & POLLIN) {
+            uint64_t n;
+            if (read(a.eng.event_fd, &n, sizeof n) < 0)
+                n = 0;
+        }
+        if (wlp_cast_closed(a.w)) {
+            fprintf(stderr, "ofgl: the compositor ended the cast\n");
+            break;
+        }
+        if (wlp_read(a.w) < 0) {
+            fprintf(stderr, "ofgl: the compositor closed the overlay\n");
+            break;
+        }
+        pw_loop_iterate(a.loop, 0);
+        if (with_flow) {
+            take_done(&a);
+            take_late(&a);
+        }
+        draw_next(&a);
+        if (wlp_flush(a.w) < 0)
+            break;
+        const uint64_t now = of_now_ns();
+        if (now >= t_print) {
+            if (!printed_format && a.format[0]) {
+                printf("cast: %s\n", a.format);
+                printed_format = 1;
+            }
+            print_second(&a, (double)(now - t_start) * 1e-9);
+            t_print += 1000000000ull;
+            if (seconds && now - t_start >= (uint64_t)seconds * 1000000000ull)
+                break;
+        }
+    }
+    if (a.stream) {
+        pw_stream_disconnect(a.stream);
+        pw_stream_destroy(a.stream);
+    }
+    if (a.loop && a.core) {
+        pw_loop_leave(a.loop);
+        pw_core_disconnect(a.core);
+        pw_context_destroy(a.pctx);
+        pw_loop_destroy(a.loop);
+    }
+    if (excluded && system("scripts/excl.sh off >/dev/null"))
+        fprintf(stderr, "ofgl: excl.sh off failed\n");
+    if (with_flow)
+        of_engine_close(&a.eng);
+    eglMakeCurrent(a.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroySurface(a.dpy, a.surf);
+    wl_egl_window_destroy(a.win);
+    eglDestroyContext(a.dpy, a.ctx);
+    wlp_close(a.w);
+    printf("ofgl: done\n");
+    return rc || a.fatal;
+}
